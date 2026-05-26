@@ -4149,7 +4149,7 @@ describe("runCodexAppServerAttempt", () => {
     });
   });
 
-  it("closes the app-server client when the active turn goes idle past the attempt timeout", async () => {
+  it("unsubscribes and closes the app-server client when the active turn goes idle past the attempt timeout", async () => {
     const close = vi.fn();
     const request = vi.fn(async (method: string) => {
       if (method === "thread/start") {
@@ -4190,6 +4190,13 @@ describe("runCodexAppServerAttempt", () => {
       {
         threadId: "thread-1",
         turnId: "turn-1",
+      },
+      { timeoutMs: 5_000 },
+    );
+    expect(request).toHaveBeenCalledWith(
+      "thread/unsubscribe",
+      {
+        threadId: "thread-1",
       },
       { timeoutMs: 5_000 },
     );

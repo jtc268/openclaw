@@ -223,6 +223,22 @@ export function clearSharedCodexAppServerClientIfCurrent(
   return false;
 }
 
+export function detachSharedCodexAppServerClientIfCurrent(
+  client: CodexAppServerClient | undefined,
+): boolean {
+  if (!client) {
+    return false;
+  }
+  const state = getSharedCodexAppServerClientState();
+  for (const [key, entry] of state.clients) {
+    if (entry.client === client) {
+      state.clients.delete(key);
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function clearSharedCodexAppServerClientIfCurrentAndWait(
   client: CodexAppServerClient | undefined,
   options?: {

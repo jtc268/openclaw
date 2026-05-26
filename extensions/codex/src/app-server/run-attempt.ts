@@ -169,7 +169,10 @@ import {
   type CodexAppServerThreadBinding,
 } from "./session-binding.js";
 import { readCodexMirroredSessionHistoryMessages } from "./session-history.js";
-import { clearSharedCodexAppServerClientIfCurrent } from "./shared-client.js";
+import {
+  clearSharedCodexAppServerClientIfCurrent,
+  detachSharedCodexAppServerClientIfCurrent,
+} from "./shared-client.js";
 import {
   areCodexDynamicToolFingerprintsCompatible,
   buildDeveloperInstructions,
@@ -3165,18 +3168,20 @@ export async function runCodexAppServerAttempt(
 
   const abortListener = () => {
     const shouldRetireClient = timedOut;
-    interruptCodexTurnBestEffort(client, {
-      threadId: thread.threadId,
-      turnId: activeTurnId,
-      timeoutMs: shouldRetireClient ? CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS : undefined,
-    });
     if (shouldRetireClient) {
-      retireCodexAppServerClientAfterTimedOutTurn(client, {
+      void retireCodexAppServerClientAfterTimedOutTurn(client, {
         threadId: thread.threadId,
         turnId: activeTurnId,
         reason: String(runAbortController.signal.reason ?? "timeout"),
+      }).finally(() => {
+        resolveCompletion?.();
       });
+      return;
     }
+    interruptCodexTurnBestEffort(client, {
+      threadId: thread.threadId,
+      turnId: activeTurnId,
+    });
     resolveCompletion?.();
   };
   runAbortController.signal.addEventListener("abort", abortListener, { once: true });
@@ -3989,26 +3994,41 @@ async function unsubscribeCodexThreadBestEffort(
   }
 }
 
-function retireCodexAppServerClientAfterTimedOutTurn(
+async function retireCodexAppServerClientAfterTimedOutTurn(
   client: CodexAppServerClient,
   params: {
     threadId: string;
     turnId: string;
     reason: string;
   },
-): void {
-  const clearedSharedClient = clearSharedCodexAppServerClientIfCurrent(client);
-  if (!clearedSharedClient) {
-    const close = (client as { close?: () => void }).close;
-    if (typeof close === "function") {
+): Promise<void> {
+  const detachedSharedClient = detachSharedCodexAppServerClientIfCurrent(client);
+  interruptCodexTurnBestEffort(client, {
+    threadId: params.threadId,
+    turnId: params.turnId,
+    timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
+  });
+  await unsubscribeCodexThreadBestEffort(client, {
+    threadId: params.threadId,
+    timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
+  });
+  const close = (client as { close?: () => void }).close;
+  if (typeof close === "function") {
+    try {
       close.call(client);
+    } catch (error) {
+      embeddedAgentLog.debug("codex app-server client close failed during timeout cleanup", {
+        threadId: params.threadId,
+        turnId: params.turnId,
+        error,
+      });
     }
   }
   embeddedAgentLog.warn("codex app-server client retired after timed-out turn", {
     threadId: params.threadId,
     turnId: params.turnId,
     reason: params.reason,
-    clearedSharedClient,
+    detachedSharedClient,
   });
 }
 
