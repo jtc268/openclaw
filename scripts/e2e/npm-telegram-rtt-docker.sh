@@ -9,7 +9,8 @@ DOCKER_TARGET="${OPENCLAW_NPM_TELEGRAM_DOCKER_TARGET:-build}"
 PACKAGE_SPEC="${OPENCLAW_NPM_TELEGRAM_PACKAGE_SPEC:-openclaw@beta}"
 PACKAGE_TGZ="${OPENCLAW_NPM_TELEGRAM_PACKAGE_TGZ:-${OPENCLAW_CURRENT_PACKAGE_TGZ:-}}"
 PACKAGE_LABEL="${OPENCLAW_NPM_TELEGRAM_PACKAGE_LABEL:-}"
-OUTPUT_DIR="${OPENCLAW_NPM_TELEGRAM_OUTPUT_DIR:-.artifacts/qa-e2e/npm-telegram-rtt}"
+RUN_ID="${OPENCLAW_NPM_TELEGRAM_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+OUTPUT_DIR="${OPENCLAW_NPM_TELEGRAM_OUTPUT_DIR:-.artifacts/qa-e2e/npm-telegram-rtt/$RUN_ID}"
 
 resolve_credential_source() {
   if [ -n "${OPENCLAW_NPM_TELEGRAM_CREDENTIAL_SOURCE:-}" ]; then
@@ -234,6 +235,7 @@ for key in \
   OPENCLAW_QA_CREDENTIAL_HEARTBEAT_INTERVAL_MS \
   OPENCLAW_QA_CREDENTIAL_ACQUIRE_TIMEOUT_MS \
   OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS \
+  OPENCLAW_QA_CREDENTIAL_HTTP_MAX_BODY_BYTES \
   OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX \
   OPENCLAW_QA_CREDENTIAL_OWNER_ID \
   OPENCLAW_QA_ALLOW_INSECURE_HTTP; do
@@ -264,18 +266,30 @@ install_source="${OPENCLAW_NPM_TELEGRAM_INSTALL_SOURCE:?missing OPENCLAW_NPM_TEL
 package_label="${OPENCLAW_NPM_TELEGRAM_PACKAGE_LABEL:-$install_source}"
 
 npm_install_timeout="${OPENCLAW_E2E_NPM_INSTALL_TIMEOUT:-600s}"
-if [ -z "$npm_install_timeout" ] || [ "$npm_install_timeout" = "0" ]; then
-  npm install -g "$install_source" --no-fund --no-audit
-elif command -v timeout >/dev/null 2>&1; then
-  if timeout --kill-after=1s 1s true >/dev/null 2>&1; then
-    timeout --kill-after=30s "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit
-  else
-    timeout "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit
+run_npm_install() {
+  if [ -z "$npm_install_timeout" ] || [ "$npm_install_timeout" = "0" ]; then
+    npm install -g "$install_source" --no-fund --no-audit
+    return
   fi
-else
-  echo "timeout command not found; running package install without OPENCLAW_E2E_NPM_INSTALL_TIMEOUT" >&2
-  npm install -g "$install_source" --no-fund --no-audit
-fi
+
+  local timeout_bin=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  fi
+  if [ -z "$timeout_bin" ]; then
+    echo "timeout or gtimeout is required for OPENCLAW_E2E_NPM_INSTALL_TIMEOUT=$npm_install_timeout" >&2
+    return 127
+  fi
+
+  if "$timeout_bin" --kill-after=1s 1s true >/dev/null 2>&1; then
+    "$timeout_bin" --kill-after=30s "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit
+  else
+    "$timeout_bin" "$npm_install_timeout" npm install -g "$install_source" --no-fund --no-audit
+  fi
+}
+run_npm_install
 command -v openclaw
 openclaw --version
 node -p "require('/npm-global/lib/node_modules/openclaw/package.json').version"
@@ -374,12 +388,30 @@ installed_version="$(node -p "require('/npm-global/lib/node_modules/openclaw/pac
 
 node /app/scripts/e2e/mock-openai-server.mjs >"$mock_log" 2>&1 &
 mock_pid="$!"
+mock_ready=0
 for _ in $(seq 1 60); do
-  if node -e "fetch('http://127.0.0.1:${mock_port}/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+  if node --input-type=module -e '
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+    try {
+      const response = await fetch(process.argv[1], { signal: controller.signal });
+      process.exit(response.ok ? 0 : 1);
+    } catch {
+      process.exit(1);
+    } finally {
+      clearTimeout(timer);
+    }
+  ' "http://127.0.0.1:${mock_port}/health"; then
+    mock_ready=1
     break
   fi
   sleep 1
 done
+if [ "$mock_ready" != "1" ]; then
+  echo "Mock OpenAI server did not become ready" >&2
+  cat "$mock_log" >&2 || true
+  exit 1
+fi
 
 mkdir -p "$(dirname "$config_path")" "$HOME/.openclaw/workspace" "$HOME/.openclaw/agents/main/sessions" "$HOME/workspace"
 

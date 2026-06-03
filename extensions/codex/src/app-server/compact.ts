@@ -1,33 +1,34 @@
 import {
   embeddedAgentLog,
-  type CompactEmbeddedPiSessionParams,
-  type EmbeddedPiCompactResult,
+  type CompactEmbeddedAgentSessionParams,
+  type EmbeddedAgentCompactResult,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { asOptionalRecord as readRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
-  defaultCodexAppServerClientFactory,
+  defaultLeasedCodexAppServerClientFactory,
   type CodexAppServerClientFactory,
 } from "./client-factory.js";
 import { resolveCodexAppServerRuntimeOptions } from "./config.js";
 import type { JsonObject } from "./protocol.js";
 import { resolveCodexNativeExecutionBlock } from "./sandbox-guard.js";
 import { readCodexAppServerBinding } from "./session-binding.js";
+import { releaseLeasedSharedCodexAppServerClient } from "./shared-client.js";
 
 const warnedIgnoredCompactionOverrides = new Set<string>();
 
 export async function maybeCompactCodexAppServerSession(
-  params: CompactEmbeddedPiSessionParams,
+  params: CompactEmbeddedAgentSessionParams,
   options: { pluginConfig?: unknown; clientFactory?: CodexAppServerClientFactory } = {},
-): Promise<EmbeddedPiCompactResult | undefined> {
+): Promise<EmbeddedAgentCompactResult | undefined> {
   warnIfIgnoringOpenClawCompactionOverrides(params);
   // Codex owns automatic context-pressure compaction for Codex runtime sessions.
-  // This entry point is only for explicit/manual compaction requests. OpenClaw
-  // starts native Codex compaction for the bound thread and returns immediately;
-  // Codex reports and applies the compaction inside its own app-server session.
+  // This entry point starts native Codex compaction for the bound thread and
+  // returns immediately; Codex applies the compaction inside its app-server.
   return compactCodexNativeThread(params, options);
 }
 
-function warnIfIgnoringOpenClawCompactionOverrides(params: CompactEmbeddedPiSessionParams): void {
+function warnIfIgnoringOpenClawCompactionOverrides(
+  params: CompactEmbeddedAgentSessionParams,
+): void {
   const ignoredConfig = readIgnoredCompactionOverridePaths(params);
   if (ignoredConfig.length === 0) {
     return;
@@ -47,7 +48,7 @@ function warnIfIgnoringOpenClawCompactionOverrides(params: CompactEmbeddedPiSess
   );
 }
 
-function readIgnoredCompactionOverridePaths(params: CompactEmbeddedPiSessionParams): string[] {
+function readIgnoredCompactionOverridePaths(params: CompactEmbeddedAgentSessionParams): string[] {
   const ignored = new Set<string>();
   for (const entry of readCompactionOverrideEntries(params)) {
     const localProvider =
@@ -71,7 +72,7 @@ function readIgnoredCompactionOverridePaths(params: CompactEmbeddedPiSessionPara
   return [...ignored];
 }
 
-function readCompactionOverrideEntries(params: CompactEmbeddedPiSessionParams): Array<{
+function readCompactionOverrideEntries(params: CompactEmbeddedAgentSessionParams): Array<{
   path: string;
   record: Record<string, unknown>;
   inheritedRecord?: Record<string, unknown>;
@@ -118,10 +119,39 @@ function readAgentIdFromSessionKey(sessionKey: string | undefined): string | und
   return parts[1]?.trim() || undefined;
 }
 
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 async function compactCodexNativeThread(
-  params: CompactEmbeddedPiSessionParams,
+  params: CompactEmbeddedAgentSessionParams,
   options: { pluginConfig?: unknown; clientFactory?: CodexAppServerClientFactory } = {},
-): Promise<EmbeddedPiCompactResult | undefined> {
+): Promise<EmbeddedAgentCompactResult | undefined> {
+  if (params.trigger !== "manual") {
+    embeddedAgentLog.info("skipping codex app-server compaction for non-manual trigger", {
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      trigger: params.trigger,
+    });
+    return {
+      ok: true,
+      compacted: false,
+      reason: "codex app-server owns automatic compaction",
+      result: {
+        summary: "",
+        firstKeptEntryId: "",
+        tokensBefore: params.currentTokenCount ?? 0,
+        details: {
+          backend: "codex-app-server",
+          skipped: true,
+          reason: "non_manual_trigger",
+          trigger: params.trigger ?? "unknown",
+        },
+      },
+    };
+  }
   const nativeExecutionBlock = resolveCodexNativeExecutionBlock({
     config: params.config,
     sessionKey: params.sandboxSessionKey ?? params.sessionKey,
@@ -148,7 +178,8 @@ async function compactCodexNativeThread(
     return { ok: false, compacted: false, reason: "auth profile mismatch for session binding" };
   }
 
-  const clientFactory = options.clientFactory ?? defaultCodexAppServerClientFactory;
+  const shouldReleaseDefaultLease = !options.clientFactory;
+  const clientFactory = options.clientFactory ?? defaultLeasedCodexAppServerClientFactory;
   const client = await clientFactory(
     appServer.start,
     requestedAuthProfileId ?? binding.authProfileId,
@@ -182,6 +213,10 @@ async function compactCodexNativeThread(
       compacted: false,
       reason: formatCompactionError(error),
     };
+  } finally {
+    if (shouldReleaseDefaultLease) {
+      releaseLeasedSharedCodexAppServerClient(client);
+    }
   }
   const resultDetails: JsonObject = {
     backend: "codex-app-server",
@@ -202,13 +237,13 @@ async function compactCodexNativeThread(
 }
 
 function failedCodexThreadBindingCompactionResult(
-  params: CompactEmbeddedPiSessionParams,
+  params: CompactEmbeddedAgentSessionParams,
   recovery: {
     reason: string;
     recovery: "missing_thread_binding" | "stale_thread_binding";
     threadId?: string;
   },
-): EmbeddedPiCompactResult {
+): EmbeddedAgentCompactResult {
   embeddedAgentLog.warn("codex app-server compaction could not use thread binding", {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,

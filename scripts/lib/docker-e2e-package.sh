@@ -20,15 +20,22 @@ if ! declare -F docker_e2e_docker_run_cmd >/dev/null 2>&1; then
       return
     fi
     local timeout_value="${DOCKER_COMMAND_TIMEOUT:-${OPENCLAW_DOCKER_E2E_RUN_TIMEOUT:-3600s}}"
+    local timeout_bin=""
     if command -v timeout >/dev/null 2>&1; then
-      if timeout --kill-after=1s 1s true >/dev/null 2>&1; then
-        timeout --kill-after=30s "$timeout_value" docker "$@"
+      timeout_bin="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+      timeout_bin="gtimeout"
+    fi
+    if [ -n "$timeout_bin" ]; then
+      if "$timeout_bin" --kill-after=1s 1s true >/dev/null 2>&1; then
+        "$timeout_bin" --kill-after=30s "$timeout_value" docker "$@"
       else
-        timeout "$timeout_value" docker "$@"
+        "$timeout_bin" "$timeout_value" docker "$@"
       fi
       return
     fi
-    docker "$@"
+    echo "timeout command not found; cannot bound Docker run after ${timeout_value}" >&2
+    return 127
   }
 fi
 
@@ -93,6 +100,9 @@ docker_e2e_package_mount_args() {
   if [ -n "${OPENCLAW_E2E_NPM_INSTALL_TIMEOUT:-}" ]; then
     DOCKER_E2E_PACKAGE_ARGS+=(-e "OPENCLAW_E2E_NPM_INSTALL_TIMEOUT=$OPENCLAW_E2E_NPM_INSTALL_TIMEOUT")
   fi
+  if [ -n "${OPENCLAW_E2E_COMMAND_TIMEOUT:-}" ]; then
+    DOCKER_E2E_PACKAGE_ARGS+=(-e "OPENCLAW_E2E_COMMAND_TIMEOUT=$OPENCLAW_E2E_COMMAND_TIMEOUT")
+  fi
 }
 
 docker_e2e_cleanup_package_tgz() {
@@ -122,6 +132,19 @@ docker_e2e_cleanup_package_mount_args() {
   done
 }
 
+docker_e2e_cleanup_container_cidfile() {
+  local cidfile="${1:-}"
+  [ -n "$cidfile" ] || return 0
+  if [ -f "$cidfile" ]; then
+    local container_id
+    container_id="$(head -n 1 "$cidfile" 2>/dev/null || true)"
+    if [ -n "$container_id" ]; then
+      docker_e2e_docker_cmd rm -f "$container_id" >/dev/null 2>&1 || true
+    fi
+    rm -f "$cidfile"
+  fi
+}
+
 docker_e2e_harness_mount_args() {
   DOCKER_E2E_HARNESS_ARGS=(
     -v "$ROOT_DIR/scripts/e2e:/app/scripts/e2e:ro"
@@ -133,7 +156,14 @@ docker_e2e_harness_mount_args() {
 docker_e2e_run_with_harness() {
   docker_e2e_harness_mount_args
   local run_status=0
-  docker_e2e_docker_run_cmd run --rm "${DOCKER_E2E_HARNESS_ARGS[@]}" "$@" || run_status="$?"
+  local cid_dir
+  local cidfile
+  cid_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-docker-e2e-container.XXXXXX")"
+  cidfile="$cid_dir/container.cid"
+  docker_e2e_docker_run_cmd run --rm --cidfile "$cidfile" "${DOCKER_E2E_HARNESS_ARGS[@]}" "$@" ||
+    run_status="$?"
+  docker_e2e_cleanup_container_cidfile "$cidfile"
+  rmdir "$cid_dir" 2>/dev/null || true
   docker_e2e_cleanup_package_mount_args
   return "$run_status"
 }
@@ -147,4 +177,14 @@ docker_e2e_run_logged_with_harness() {
   local label="$1"
   shift
   run_logged "$label" docker_e2e_run_with_harness "$@"
+}
+
+docker_e2e_run_logged_print_with_harness() {
+  local label="$1"
+  shift
+  run_logged_print_heartbeat \
+    "$label" \
+    "${OPENCLAW_DOCKER_E2E_LOG_HEARTBEAT_SECONDS:-30}" \
+    docker_e2e_run_with_harness \
+    "$@"
 }

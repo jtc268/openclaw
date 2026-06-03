@@ -1,3 +1,4 @@
+import { theme } from "../../packages/terminal-core/src/theme.js";
 import {
   assertConfigWriteAllowedInCurrentMode,
   getRuntimeConfig,
@@ -12,7 +13,6 @@ import {
 } from "../plugins/installed-plugin-index-records.js";
 import { updateNpmInstalledPlugins } from "../plugins/update.js";
 import { defaultRuntime } from "../runtime.js";
-import { theme } from "../terminal/theme.js";
 import { commitPluginInstallRecordsWithConfig } from "./plugins-install-record-commit.js";
 import { refreshPluginRegistryAfterConfigMutation } from "./plugins-registry-refresh.js";
 import { logPluginUpdateOutcomes } from "./plugins-update-outcomes.js";
@@ -21,6 +21,9 @@ import {
   resolvePluginUpdateSelection,
 } from "./plugins-update-selection.js";
 import { promptYesNo } from "./prompt.js";
+
+const DEPRECATED_DANGEROUS_FORCE_UNSAFE_UPDATE_WARNING =
+  "--dangerously-force-unsafe-install is deprecated and no longer affects plugin updates because built-in install-time dangerous-code scanning has been removed. Configure security.installPolicy for operator-owned install decisions.";
 
 export async function runPluginUpdateCommand(params: {
   id?: string;
@@ -36,6 +39,9 @@ export async function runPluginUpdateCommand(params: {
     info: (msg: string) => defaultRuntime.log(msg),
     warn: (msg: string) => defaultRuntime.log(theme.warn(msg)),
   };
+  if (params.opts.dangerouslyForceUnsafeInstall) {
+    defaultRuntime.log(theme.warn(DEPRECATED_DANGEROUS_FORCE_UNSAFE_UPDATE_WARNING));
+  }
   const pluginSelection = resolvePluginUpdateSelection({
     installs: pluginInstallRecords,
     rawId: params.id,

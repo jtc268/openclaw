@@ -1,5 +1,5 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { AgentMessage } from "../agents/runtime/index.js";
 
 export const INPUT_PROVENANCE_KIND_VALUES = [
   "external_user",
@@ -145,6 +145,10 @@ function removeFirstInterSessionPromptPrefix(text: string): string {
   return [text.slice(0, index).trimEnd(), text.slice(explanationEnd).trimStart()]
     .filter(Boolean)
     .join("\n");
+}
+
+export function stripInterSessionPromptPrefixForDisplay(text: string): string {
+  return removeFirstInterSessionPromptPrefix(text);
 }
 
 export function annotateInterSessionPromptText(

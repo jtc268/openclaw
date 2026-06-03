@@ -43,6 +43,7 @@ export const createTestRegistry = (channels: TestChannelRegistration[] = []): Pl
   agentToolResultMiddlewares: [],
   memoryEmbeddingProviders: [],
   textTransforms: [],
+  cliBackends: [],
   agentHarnesses: [],
   gatewayHandlers: {},
   gatewayMethodDescriptors: [],
@@ -81,6 +82,17 @@ export const createChannelTestPluginBase = (params: {
     resolveAccount: () => ({}),
     ...params.config,
   },
+});
+
+export const createDirectOutboundTestAdapter = (params: {
+  channel: ChannelId;
+  messageId?: string;
+  resolveTarget?: ChannelOutboundAdapter["resolveTarget"];
+}): ChannelOutboundAdapter => ({
+  deliveryMode: "direct",
+  ...(params.resolveTarget ? { resolveTarget: params.resolveTarget } : {}),
+  sendText: async () => ({ channel: params.channel, messageId: params.messageId ?? "msg-test" }),
+  sendMedia: async () => ({ channel: params.channel, messageId: params.messageId ?? "msg-test" }),
 });
 
 export const createMSTeamsTestPluginBase = (): Pick<

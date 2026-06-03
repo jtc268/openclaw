@@ -1,9 +1,9 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   hasNonEmptyString as hasNonEmptyStringField,
   normalizeOptionalString,
   readStringValue,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { AgentMessage } from "./runtime/index.js";
 import {
   extractToolCallsFromAssistant,
   extractToolResultId,
@@ -125,6 +125,27 @@ function isReplaySafeThinkingAssistantTurn(
   return sawToolCall;
 }
 
+function hasSessionsSpawnAttachmentToolCall(content: unknown[]): boolean {
+  for (const block of content) {
+    if (!isRawToolCallBlock(block) || block.name !== "sessions_spawn") {
+      continue;
+    }
+    const input = block.input;
+    if (!input || typeof input !== "object") {
+      continue;
+    }
+    const attachments = (input as { attachments?: unknown }).attachments;
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const DEFAULT_MISSING_TOOL_RESULT_TEXT =
+  "[openclaw] missing tool result in session history; inserted synthetic error result for transcript repair.";
+const SYNTHETIC_MISSING_TOOL_RESULT_DETAIL_KEY = "openclawSyntheticMissingToolResult";
+
 function makeMissingToolResult(params: {
   toolCallId: string;
   toolName?: string;
@@ -142,14 +163,38 @@ function makeMissingToolResult(params: {
     content: [
       {
         type: "text",
-        text:
-          params.text ??
-          "[openclaw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        text: params.text ?? DEFAULT_MISSING_TOOL_RESULT_TEXT,
       },
     ],
+    details: { [SYNTHETIC_MISSING_TOOL_RESULT_DETAIL_KEY]: true },
     isError: true,
     timestamp: Date.now(),
   } as Extract<AgentMessage, { role: "toolResult" }>;
+}
+
+function isSyntheticMissingToolResult(msg: Extract<AgentMessage, { role: "toolResult" }>): boolean {
+  if (!(msg as { isError?: unknown }).isError) {
+    return false;
+  }
+  const details = (msg as { details?: unknown }).details;
+  if (
+    details &&
+    typeof details === "object" &&
+    (details as Record<string, unknown>)[SYNTHETIC_MISSING_TOOL_RESULT_DETAIL_KEY] === true
+  ) {
+    return true;
+  }
+  const content = (msg as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some(
+    (block: unknown) =>
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type?: string }).type === "text" &&
+      (block as { text?: string }).text === DEFAULT_MISSING_TOOL_RESULT_TEXT,
+  );
 }
 
 function normalizeToolResultName(
@@ -176,7 +221,23 @@ function normalizeToolResultName(
   return message;
 }
 
-export { makeMissingToolResult };
+function normalizeLegacyToolResultId(
+  message: Extract<AgentMessage, { role: "toolResult" }>,
+  toolCalls: Array<{ id: string; name?: string }>,
+): Extract<AgentMessage, { role: "toolResult" }> {
+  if (extractToolResultId(message) || toolCalls.length !== 1) {
+    return message;
+  }
+  const [toolCall] = toolCalls;
+  const toolResultName = normalizeOptionalString((message as { toolName?: unknown }).toolName);
+  const toolCallName = normalizeOptionalString(toolCall.name);
+  if (toolResultName && toolCallName && toolResultName !== toolCallName) {
+    return message;
+  }
+  return { ...message, toolCallId: toolCall.id, isError: true };
+}
+
+export { DEFAULT_MISSING_TOOL_RESULT_TEXT, makeMissingToolResult };
 
 type ToolCallInputRepairReport = {
   messages: AgentMessage[];
@@ -221,6 +282,11 @@ function collectFollowingToolResults(
   index: number,
 ): { ids: Set<string>; displaced: boolean } {
   const ids = new Set<string>();
+  const assistant = messages[index];
+  const currentToolCalls =
+    assistant && typeof assistant === "object" && assistant.role === "assistant"
+      ? extractToolCallsFromAssistant(assistant)
+      : [];
   let sawNonToolResult = false;
   let displaced = false;
   for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
@@ -233,7 +299,8 @@ function collectFollowingToolResults(
       break;
     }
     if (message.role === "toolResult") {
-      const resultIds = extractToolResultIds(message);
+      const normalizedLegacyResult = normalizeLegacyToolResultId(message, currentToolCalls);
+      const resultIds = extractToolResultIds(normalizedLegacyResult);
       for (const id of resultIds) {
         ids.add(id);
       }
@@ -276,9 +343,9 @@ function repairToolCallInputs(
       countRawToolCallBlocks(msg.content) > 0
     ) {
       // Signed Anthropic thinking blocks must remain byte-for-byte stable on
-      // replay. Preserve the turn only if every sibling tool call is already
-      // valid and already has a real tool result. Otherwise drop the
-      // whole assistant turn rather than mutating provider-owned content.
+      // replay. Preserve the turn when every sibling tool call is already valid;
+      // the later pairing repair can synthesize missing legacy tool results
+      // without mutating provider-owned assistant content.
       const replaySafeToolCalls = extractToolCallsFromAssistant(msg);
       const followingToolResults = collectFollowingToolResults(messages, index);
       if (
@@ -286,8 +353,9 @@ function repairToolCallInputs(
         replaySafeToolCalls.every(
           (toolCall) =>
             !preservedThinkingToolCallIds.has(toolCall.id) &&
-            (!followingToolResults.displaced || !priorToolCallIds.has(toolCall.id)) &&
-            followingToolResults.ids.has(toolCall.id),
+            (!hasSessionsSpawnAttachmentToolCall(msg.content) ||
+              followingToolResults.ids.has(toolCall.id)) &&
+            (!followingToolResults.displaced || !priorToolCallIds.has(toolCall.id)),
         )
       ) {
         for (const toolCall of replaySafeToolCalls) {
@@ -405,6 +473,29 @@ function assistantHasToolCalls(message: AgentMessage): boolean {
   return extractToolCallsFromAssistant(message).length > 0;
 }
 
+function findLaterMatchingToolResult(params: {
+  messages: AgentMessage[];
+  startIndex: number;
+  toolCallId: string;
+  toolName?: string;
+  toolCalls: Array<{ id: string; name?: string }>;
+  seenToolResultIds: Set<string>;
+}): Extract<AgentMessage, { role: "toolResult" }> | undefined {
+  for (let index = params.startIndex; index < params.messages.length; index += 1) {
+    const candidate = params.messages[index];
+    if (!candidate || typeof candidate !== "object" || candidate.role !== "toolResult") {
+      continue;
+    }
+    const normalizedLegacyResult = normalizeLegacyToolResultId(candidate, params.toolCalls);
+    const id = extractToolResultId(normalizedLegacyResult);
+    if (!id || id !== params.toolCallId || params.seenToolResultIds.has(id)) {
+      continue;
+    }
+    return normalizeToolResultName(normalizedLegacyResult, params.toolName);
+  }
+  return undefined;
+}
+
 export function repairToolUseResultPairing(
   messages: AgentMessage[],
   options?: ToolUseResultPairingOptions,
@@ -418,6 +509,7 @@ export function repairToolUseResultPairing(
   const out: AgentMessage[] = [];
   const added: Array<Extract<AgentMessage, { role: "toolResult" }>> = [];
   const seenToolResultIds = new Set<string>();
+  const toolResultPositions = new Map<string, number>();
   let droppedDuplicateCount = 0;
   let droppedOrphanCount = 0;
   let moved = false;
@@ -426,12 +518,31 @@ export function repairToolUseResultPairing(
   const pushToolResult = (msg: Extract<AgentMessage, { role: "toolResult" }>) => {
     const id = extractToolResultId(msg);
     if (id && seenToolResultIds.has(id)) {
+      const existingIdx = toolResultPositions.get(id);
+      if (existingIdx !== undefined) {
+        const existing = out[existingIdx];
+        if (
+          existing &&
+          isSyntheticMissingToolResult(existing as Extract<AgentMessage, { role: "toolResult" }>) &&
+          !isSyntheticMissingToolResult(msg)
+        ) {
+          out[existingIdx] = msg;
+          const addedIdx = added.findIndex((a) => extractToolResultId(a) === id);
+          if (addedIdx !== -1) {
+            added.splice(addedIdx, 1);
+          }
+          droppedDuplicateCount += 1;
+          changed = true;
+          return;
+        }
+      }
       droppedDuplicateCount += 1;
       changed = true;
       return;
     }
     if (id) {
       seenToolResultIds.add(id);
+      toolResultPositions.set(id, out.length);
     }
     out.push(msg);
   };
@@ -495,13 +606,18 @@ export function repairToolUseResultPairing(
       }
 
       if (nextRole === "toolResult") {
-        const toolResult = next as Extract<AgentMessage, { role: "toolResult" }>;
+        const toolResult = normalizeLegacyToolResultId(
+          next as Extract<AgentMessage, { role: "toolResult" }>,
+          toolCalls,
+        );
         const id = extractToolResultId(toolResult);
+        if (id && seenToolResultIds.has(id)) {
+          pushToolResult(normalizeToolResultName(toolResult, toolCallNamesById.get(id)));
+          continue;
+        }
         if (id && toolCallIds.has(id)) {
-          if (seenToolResultIds.has(id)) {
-            droppedDuplicateCount += 1;
+          if (toolResult !== next) {
             changed = true;
-            continue;
           }
           const normalizedToolResult = normalizeToolResultName(
             toolResult,
@@ -510,8 +626,19 @@ export function repairToolUseResultPairing(
           if (normalizedToolResult !== toolResult) {
             changed = true;
           }
-          if (!spanResultsById.has(id)) {
+          const existingSpan = spanResultsById.get(id);
+          if (!existingSpan) {
             spanResultsById.set(id, normalizedToolResult);
+          } else if (
+            isSyntheticMissingToolResult(existingSpan) &&
+            !isSyntheticMissingToolResult(normalizedToolResult)
+          ) {
+            spanResultsById.set(id, normalizedToolResult);
+            droppedDuplicateCount += 1;
+            changed = true;
+          } else {
+            droppedDuplicateCount += 1;
+            changed = true;
           }
           continue;
         }
@@ -566,14 +693,28 @@ export function repairToolUseResultPairing(
       if (existing) {
         pushToolResult(existing);
       } else {
-        const missing = makeMissingToolResult({
+        const laterResult = findLaterMatchingToolResult({
+          messages,
+          startIndex: j,
           toolCallId: call.id,
           toolName: call.name,
-          text: options?.missingToolResultText,
+          toolCalls,
+          seenToolResultIds,
         });
-        added.push(missing);
-        changed = true;
-        pushToolResult(missing);
+        if (laterResult) {
+          moved = true;
+          changed = true;
+          pushToolResult(laterResult);
+        } else {
+          const missing = makeMissingToolResult({
+            toolCallId: call.id,
+            toolName: call.name,
+            text: options?.missingToolResultText,
+          });
+          added.push(missing);
+          changed = true;
+          pushToolResult(missing);
+        }
       }
     }
 

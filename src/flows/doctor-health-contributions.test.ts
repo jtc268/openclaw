@@ -12,9 +12,14 @@ const mocks = vi.hoisted(() => ({
   registerBundledHealthChecks: vi.fn(),
   runDoctorHealthRepairs: vi.fn(),
   listHealthChecks: vi.fn(),
+  getHealthCheck: vi.fn(),
   resolveAgentWorkspaceDir: vi.fn(() => "/tmp/openclaw-workspace"),
   resolveDefaultAgentId: vi.fn(() => "default"),
   note: vi.fn(),
+  loadModelCatalog: vi.fn(async () => []),
+  getModelRefStatus: vi.fn(() => ({ allowed: true, inCatalog: true, key: "openai/gpt-5.5" })),
+  resolveConfiguredModelRef: vi.fn(() => ({ provider: "openai", model: "gpt-5.5" })),
+  resolveHooksGmailModel: vi.fn(() => ({ provider: "openai", model: "gpt-5.5" })),
   replaceConfigFile: vi.fn().mockResolvedValue(undefined),
   readConfigFileSnapshot: vi.fn().mockResolvedValue({
     exists: true,
@@ -22,11 +27,19 @@ const mocks = vi.hoisted(() => ({
     config: {},
     issues: [],
   }),
+  checkGatewayHealth: vi.fn(),
+  probeGatewayMemoryStatus: vi.fn(),
   applyWizardMetadata: vi.fn((cfg: unknown) => cfg),
   logConfigUpdated: vi.fn(),
+  isRecord: vi.fn(
+    (value: unknown): value is Record<string, unknown> =>
+      typeof value === "object" && value !== null && !Array.isArray(value),
+  ),
   shortenHomePath: vi.fn((p: string) => p),
   formatCliCommand: vi.fn((cmd: string) => cmd),
 }));
+
+const DOCTOR_GATEWAY_HEALTH_ID = "doctor:gateway-health";
 
 vi.mock("../commands/doctor/shared/release-configured-plugin-installs.js", () => ({
   maybeRunConfiguredPluginInstallReleaseStep: mocks.maybeRunConfiguredPluginInstallReleaseStep,
@@ -46,6 +59,7 @@ vi.mock("./doctor-repair-flow.js", () => ({
 
 vi.mock("./health-check-registry.js", () => ({
   listHealthChecks: mocks.listHealthChecks,
+  getHealthCheck: mocks.getHealthCheck,
 }));
 
 vi.mock("../agents/agent-scope.js", () => ({
@@ -53,8 +67,18 @@ vi.mock("../agents/agent-scope.js", () => ({
   resolveDefaultAgentId: mocks.resolveDefaultAgentId,
 }));
 
-vi.mock("../terminal/note.js", () => ({
+vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note: mocks.note,
+}));
+
+vi.mock("../agents/model-catalog.js", () => ({
+  loadModelCatalog: mocks.loadModelCatalog,
+}));
+
+vi.mock("../agents/model-selection.js", () => ({
+  getModelRefStatus: mocks.getModelRefStatus,
+  resolveConfiguredModelRef: mocks.resolveConfiguredModelRef,
+  resolveHooksGmailModel: mocks.resolveHooksGmailModel,
 }));
 
 vi.mock("../version.js", () => ({
@@ -67,6 +91,11 @@ vi.mock("../config/config.js", () => ({
   readConfigFileSnapshot: mocks.readConfigFileSnapshot,
 }));
 
+vi.mock("../commands/doctor-gateway-health.js", () => ({
+  checkGatewayHealth: mocks.checkGatewayHealth,
+  probeGatewayMemoryStatus: mocks.probeGatewayMemoryStatus,
+}));
+
 vi.mock("../commands/onboard-helpers.js", () => ({
   applyWizardMetadata: mocks.applyWizardMetadata,
 }));
@@ -76,6 +105,7 @@ vi.mock("../config/logging.js", () => ({
 }));
 
 vi.mock("../utils.js", () => ({
+  isRecord: mocks.isRecord,
   shortenHomePath: mocks.shortenHomePath,
 }));
 
@@ -131,13 +161,28 @@ describe("doctor health contributions", () => {
     mocks.listHealthChecks.mockReset();
     mocks.listHealthChecks.mockReturnValue([
       { id: "core/doctor/shell-completion" },
+      { id: "core/doctor/ui-protocol-freshness" },
       { id: "core/doctor/unrelated" },
     ]);
+    mocks.getHealthCheck.mockReset();
+    mocks.getHealthCheck.mockReturnValue(undefined);
     mocks.resolveAgentWorkspaceDir.mockReset();
     mocks.resolveAgentWorkspaceDir.mockReturnValue("/tmp/openclaw-workspace");
     mocks.resolveDefaultAgentId.mockReset();
     mocks.resolveDefaultAgentId.mockReturnValue("default");
     mocks.note.mockReset();
+    mocks.loadModelCatalog.mockReset();
+    mocks.loadModelCatalog.mockResolvedValue([]);
+    mocks.getModelRefStatus.mockReset();
+    mocks.getModelRefStatus.mockReturnValue({
+      allowed: true,
+      inCatalog: true,
+      key: "openai/gpt-5.5",
+    });
+    mocks.resolveConfiguredModelRef.mockReset();
+    mocks.resolveConfiguredModelRef.mockReturnValue({ provider: "openai", model: "gpt-5.5" });
+    mocks.resolveHooksGmailModel.mockReset();
+    mocks.resolveHooksGmailModel.mockReturnValue({ provider: "openai", model: "gpt-5.5" });
     mocks.readConfigFileSnapshot.mockReset();
     mocks.readConfigFileSnapshot.mockResolvedValue({
       exists: true,
@@ -145,6 +190,8 @@ describe("doctor health contributions", () => {
       config: {},
       issues: [],
     });
+    mocks.checkGatewayHealth.mockReset();
+    mocks.probeGatewayMemoryStatus.mockReset();
   });
 
   afterEach(() => {
@@ -160,6 +207,32 @@ describe("doctor health contributions", () => {
       ids.indexOf("doctor:plugin-registry"),
     );
     expect(ids.indexOf("doctor:plugin-registry")).toBeLessThan(ids.indexOf("doctor:write-config"));
+  });
+
+  it("skips read-scope gateway probes when gateway health only proved reachability", async () => {
+    mocks.checkGatewayHealth.mockResolvedValue({
+      authenticated: false,
+      healthOk: true,
+    });
+    const contribution = requireDoctorContribution(DOCTOR_GATEWAY_HEALTH_ID);
+    const ctx = {
+      cfg: {},
+      configResult: { cfg: {} },
+      sourceConfigValid: true,
+      prompter: buildDoctorPrompter(false),
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      options: {},
+      cfgForPersistence: {},
+      configPath: "/tmp/fake-openclaw.json",
+      env: {},
+    } as Parameters<(typeof contribution)["run"]>[0];
+
+    await contribution.run(ctx);
+
+    expect(ctx.healthOk).toBe(true);
+    expect(ctx.gatewayHealthAuthenticated).toBe(false);
+    expect(ctx.gatewayMemoryProbe).toEqual({ checked: false, ready: false, skipped: true });
+    expect(mocks.probeGatewayMemoryStatus).not.toHaveBeenCalled();
   });
 
   it("keeps release configured plugin installs repair-only", async () => {
@@ -249,6 +322,34 @@ describe("doctor health contributions", () => {
     expect(ids.indexOf("doctor:skills")).toBeLessThan(ids.indexOf("doctor:write-config"));
   });
 
+  it("uses the read-only model catalog for hooks.gmail.model warnings", async () => {
+    const contribution = requireDoctorContribution("doctor:hooks-model");
+    const cfg = {
+      hooks: {
+        gmail: {
+          model: "openai/gpt-5.5",
+        },
+      },
+    };
+    const ctx = {
+      cfg,
+      options: {},
+    } as Parameters<(typeof contribution)["run"]>[0];
+
+    await contribution.run(ctx);
+
+    expect(mocks.loadModelCatalog).toHaveBeenCalledWith({ config: cfg, readOnly: true });
+  });
+
+  it("repairs heartbeat templates before final config writes", () => {
+    const ids = resolveDoctorHealthContributions().map((entry) => entry.id);
+
+    expect(ids.indexOf("doctor:heartbeat-template-repair")).toBeGreaterThan(-1);
+    expect(ids.indexOf("doctor:heartbeat-template-repair")).toBeLessThan(
+      ids.indexOf("doctor:write-config"),
+    );
+  });
+
   it("runs structured repairs before legacy skill repairs and config writes", () => {
     const ids = resolveDoctorHealthContributions().map((entry) => entry.id);
 
@@ -261,7 +362,7 @@ describe("doctor health contributions", () => {
     );
   });
 
-  it("keeps legacy positional shell completion out of the broad structured repair pass", async () => {
+  it("keeps legacy positional repairs out of the broad structured repair pass", async () => {
     const contribution = requireDoctorContribution("doctor:structured-health-repairs");
     const ctx = {
       cfg: {},
@@ -280,6 +381,92 @@ describe("doctor health contributions", () => {
     expect(mocks.runDoctorHealthRepairs).toHaveBeenCalledWith(expect.any(Object), {
       checks: [{ id: "core/doctor/unrelated" }],
     });
+  });
+
+  it("reports runtime tool schema blockers during normal doctor runs", async () => {
+    const contribution = requireDoctorContribution("doctor:runtime-tool-schemas");
+    mocks.getHealthCheck.mockReturnValue({
+      id: "core/doctor/runtime-tool-schemas",
+      detect: vi.fn(async () => [
+        {
+          checkId: "core/doctor/runtime-tool-schemas",
+          severity: "error",
+          message:
+            "Tool fuzzplugin_move_angles from plugin fuzzplugin has an unsupported input schema for runtime projection.",
+          path: "plugins.entries.fuzzplugin",
+          target: "fuzzplugin_move_angles",
+          requirement: 'fuzzplugin_move_angles.parameters.type must be "object"',
+          fixHint:
+            "Disable or update the offending plugin/tool so its parameters are a JSON object schema, then rerun doctor.",
+        },
+      ]),
+    });
+    const ctx = {
+      cfg: {},
+      configResult: { cfg: {} },
+      sourceConfigValid: true,
+      prompter: buildDoctorPrompter(false),
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      options: {},
+      cfgForPersistence: {},
+      configPath: "/tmp/fake-openclaw.json",
+      env: {},
+    } as Parameters<(typeof contribution)["run"]>[0];
+
+    await contribution.run(ctx);
+
+    expect(ctx.healthOk).toBe(false);
+    expect(mocks.note).toHaveBeenCalledWith(
+      expect.stringContaining("Tool fuzzplugin_move_angles from plugin fuzzplugin"),
+      "Doctor warnings",
+    );
+    expect(mocks.note).toHaveBeenCalledWith(
+      expect.stringContaining('issue: fuzzplugin_move_angles.parameters.type must be "object"'),
+      "Doctor warnings",
+    );
+  });
+
+  it("reports provider catalog projection blockers during normal doctor runs", async () => {
+    const contribution = requireDoctorContribution("doctor:provider-catalog-projection");
+    mocks.getHealthCheck.mockReturnValue({
+      id: "core/doctor/provider-catalog-projection",
+      detect: vi.fn(async () => [
+        {
+          checkId: "core/doctor/provider-catalog-projection",
+          severity: "error",
+          message:
+            "Provider catalog mockplugin cannot be projected into the unified text model catalog.",
+          path: "plugins.entries.mockplugin",
+          target: "mockplugin",
+          requirement: "provider catalog entry read failed",
+          fixHint:
+            "Fix the plugin provider catalog hook or disable the plugin, then rerun doctor before relying on model discovery.",
+        },
+      ]),
+    });
+    const ctx = {
+      cfg: {},
+      configResult: { cfg: {} },
+      sourceConfigValid: true,
+      prompter: buildDoctorPrompter(false),
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      options: {},
+      cfgForPersistence: {},
+      configPath: "/tmp/fake-openclaw.json",
+      env: {},
+    } as Parameters<(typeof contribution)["run"]>[0];
+
+    await contribution.run(ctx);
+
+    expect(ctx.healthOk).toBe(false);
+    expect(mocks.note).toHaveBeenCalledWith(
+      expect.stringContaining("Provider catalog mockplugin cannot be projected"),
+      "Doctor warnings",
+    );
+    expect(mocks.note).toHaveBeenCalledWith(
+      expect.stringContaining("issue: provider catalog entry read failed"),
+      "Doctor warnings",
+    );
   });
 
   it("skips doctor config writes under legacy update parents", () => {

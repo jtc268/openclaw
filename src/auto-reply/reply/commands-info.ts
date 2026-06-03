@@ -2,7 +2,10 @@ import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveEffectiveToolInventory } from "../../agents/tools-effective-inventory.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import { logVerbose } from "../../globals.js";
-import { listSkillCommandsForAgents, resolveSkillCommandInvocation } from "../skill-commands.js";
+import {
+  listSkillCommandsForAgents,
+  resolveSkillCommandInvocation,
+} from "../../skills/discovery/chat-commands.js";
 import {
   buildCommandsMessage,
   buildCommandsMessagePaginated,
@@ -20,6 +23,28 @@ import { extractExplicitGroupId } from "./group-id.js";
 import { resolveReplyToMode } from "./reply-threading.js";
 export { handleContextCommand } from "./commands-context-command.js";
 export { handleWhoamiCommand } from "./commands-whoami.js";
+
+async function resolveSkillCommands(
+  params: HandleCommandsParams,
+  options?: { requireFullList?: boolean },
+) {
+  if (
+    params.skillCommands !== undefined &&
+    (!options?.requireFullList || params.skillCommands.length > 0 || !params.loadSkillCommands)
+  ) {
+    return params.skillCommands;
+  }
+  if (params.loadSkillCommands) {
+    return params.loadSkillCommands();
+  }
+  const agentId = params.sessionKey
+    ? resolveSessionAgentId({ sessionKey: params.sessionKey, config: params.cfg })
+    : params.agentId;
+  return listSkillCommandsForAgents({
+    cfg: params.cfg,
+    agentIds: agentId ? [agentId] : undefined,
+  });
+}
 
 export const handleHelpCommand: CommandHandler = async (params, allowTextCommands) => {
   if (!allowTextCommands) {
@@ -56,12 +81,7 @@ export const handleCommandsListCommand: CommandHandler = async (params, allowTex
   const agentId = params.sessionKey
     ? resolveSessionAgentId({ sessionKey: params.sessionKey, config: params.cfg })
     : params.agentId;
-  const skillCommands =
-    params.skillCommands ??
-    listSkillCommandsForAgents({
-      cfg: params.cfg,
-      agentIds: agentId ? [agentId] : undefined,
-    });
+  const skillCommands = await resolveSkillCommands(params);
   const surface = params.ctx.Surface;
   const commandPlugin = surface ? getChannelPlugin(surface) : null;
   const paginated = buildCommandsMessagePaginated(params.cfg, skillCommands, {
@@ -123,15 +143,7 @@ export const handleSkillCommandUsage: CommandHandler = async (params, allowTextC
   }
 
   const [, rawName] = normalized.match(/^\/skill(?:\s+([^\s]+))?/u) ?? [];
-  const agentId = params.sessionKey
-    ? resolveSessionAgentId({ sessionKey: params.sessionKey, config: params.cfg })
-    : params.agentId;
-  const skillCommands =
-    params.skillCommands ??
-    listSkillCommandsForAgents({
-      cfg: params.cfg,
-      agentIds: agentId ? [agentId] : undefined,
-    });
+  const skillCommands = await resolveSkillCommands(params, { requireFullList: true });
   if (
     rawName &&
     resolveSkillCommandInvocation({ commandBodyNormalized: normalized, skillCommands })
@@ -150,7 +162,7 @@ export const handleToolsCommand: CommandHandler = async (params, allowTextComman
     return null;
   }
   const normalized = params.command.commandBodyNormalized;
-  let verbose = false;
+  let verbose;
   if (normalized === "/tools" || normalized === "/tools compact") {
     verbose = false;
   } else if (normalized === "/tools verbose") {
