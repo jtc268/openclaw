@@ -1,0 +1,4 @@
+interface:
+  display_name: "GLKVM Direct Control"
+  short_description: "Operate the Comet KVM through video and USB HID"
+  default_prompt: "Use $glkvm-direct-control to inspect and operate the Mac through the Comet KVM."
